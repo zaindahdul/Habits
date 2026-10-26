@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Habit Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2316a34a'/%3E%3Cpath d='M9 16.5l4.5 4.5L23 11.5' fill='none' stroke='white' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <div>
+        <h1>Habits</h1>
+        <p class="range" id="range"></p>
+      </div>
+      <nav class="week-nav" aria-label="Change week">
+        <button class="icon-btn" id="prev" type="button" aria-label="Previous week">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg>
+        </button>
+        <button class="text-btn" id="current" type="button">This week</button>
+        <button class="icon-btn" id="next" type="button" aria-label="Next week">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5"/></svg>
+        </button>
+      </nav>
+    </header>
+
+    <section class="progress" aria-label="Week progress">
+      <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+      <span class="progress-label" id="progress-label"></span>
+    </section>
+
+    <div class="card">
+      <div class="table-wrap" id="table-wrap">
+        <table class="grid">
+          <thead><tr id="head"></tr></thead>
+          <tbody id="body"></tbody>
+          <tfoot><tr id="foot"></tr></tfoot>
+        </table>
+      </div>
+    </div>
+
+    <p class="note" id="note">Saved automatically in this browser.</p>
+  </main>
+
+  <div class="popover" id="gym-pop" role="dialog" aria-label="Log workout" hidden>
+    <div class="seg" id="gym-seg">
+      <button type="button" data-type="lifting">Lifting</button>
+      <button type="button" data-type="cardio">Cardio</button>
+    </div>
+    <div class="chips" id="gym-chips"></div>
+    <button type="button" class="clear-btn" id="gym-clear">Clear</button>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
