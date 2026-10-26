@@ -1,4 +1,4 @@
-// Weekly habit tracker. Everything is saved in this browser's localStorage.
+// Weekly habit tracker. Data is saved in this browser and, once you pick one, to a file on your computer.
 (() => {
   'use strict';
 
@@ -19,7 +19,9 @@
   };
 
   const STORAGE_KEY = 'habit-tracker:v1';
+  const SAVED_AT_KEY = 'habit-tracker:v1:savedAt';
   const MAX_MINUTES = 24 * 60;
+  const DATE_KEY = /^\d{4}-\d{2}-\d{2}$/;
 
   const $ = id => document.getElementById(id);
 
@@ -30,6 +32,7 @@
   const startOfToday = () => addDays(new Date(), 0);
   const startOfWeek = d => addDays(d, -((d.getDay() + 6) % 7)); // weeks start on Monday
   const fmtDate = (d, opts) => d.toLocaleDateString(undefined, opts);
+  const fmtTime = d => d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 
   function fmtMinutes(total) {
     const h = Math.floor(total / 60);
@@ -38,31 +41,51 @@
     return m ? `${h}h ${m}m` : `${h}h`;
   }
 
-  // ---------- Storage ----------
+  // ---------- Data ----------
   // data = { 'YYYY-MM-DD': { water: true, gym: { type: 'lifting', focus: 'Chest' }, study: 90 } }
-  function load() {
+  // savedAt = when anything last changed, used to decide which copy is newer.
+  let data = {};
+  let savedAt = 0;
+  let localOk = true;
+
+  function cleanDays(obj) {
+    const days = {};
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      for (const [key, value] of Object.entries(obj)) {
+        if (DATE_KEY.test(key) && value && typeof value === 'object' && !Array.isArray(value)) days[key] = value;
+      }
+    }
+    return days;
+  }
+
+  function loadLocal() {
     try {
-      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+      data = cleanDays(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
+      savedAt = Number(localStorage.getItem(SAVED_AT_KEY)) || 0;
     } catch {
-      return {};
+      data = {};
+      savedAt = 0;
     }
   }
 
-  function save() {
+  function writeLocal() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      localStorage.setItem(SAVED_AT_KEY, String(savedAt));
+      localOk = true;
     } catch {
-      warnNoStorage();
+      localOk = false;
     }
   }
 
-  function warnNoStorage() {
-    $('note').textContent = "Your browser is blocking storage, so changes won't be kept after you close this page.";
-    $('note').classList.add('warn');
+  // Runs after every edit.
+  function save() {
+    savedAt = Math.max(Date.now(), savedAt + 1);
+    const wasOk = localOk;
+    writeLocal();
+    if (localOk !== wasOk) renderSaveBar();
+    queueFileWrite();
   }
-
-  let data = load();
 
   function dayData(key) {
     const entry = data[key];
@@ -73,8 +96,8 @@
     const entry = { ...dayData(key) };
     if (value) entry[id] = value;
     else delete entry[id];
-    if (Object.keys(entry).length) data[key] = entry;
-    else delete data[key];
+    // A cleared day is kept as {} so it stays cleared when merging with an older file.
+    data[key] = entry;
     save();
   }
 
@@ -93,6 +116,28 @@
     if (habit.type === 'gym') return getWorkout(key, habit.id) !== null;
     if (habit.type === 'time') return getMinutes(key, habit.id) > 0;
     return dayData(key)[habit.id] === true;
+  }
+
+  // Combine a saved file with what's here. Days only one side has are always kept;
+  // for days both have, whichever copy was changed more recently wins.
+  function mergeIn(incoming) {
+    const merged = { ...data };
+    for (const [key, value] of Object.entries(incoming.days)) {
+      if (!Object.hasOwn(merged, key) || incoming.savedAt > savedAt) merged[key] = value;
+    }
+    const changed = JSON.stringify(merged) !== JSON.stringify(data);
+    data = merged;
+    savedAt = Math.max(savedAt, incoming.savedAt);
+    writeLocal();
+    if (changed) render();
+  }
+
+  const backupText = () => JSON.stringify({ app: 'habit-tracker', version: 1, savedAt, days: data }, null, 2);
+
+  function parseBackup(text) {
+    const parsed = JSON.parse(text);
+    if (!parsed || parsed.app !== 'habit-tracker') throw new Error('Not a habit tracker file');
+    return { days: cleanDays(parsed.days), savedAt: Number(parsed.savedAt) || 0 };
   }
 
   // ---------- View state ----------
@@ -404,6 +449,259 @@
   window.addEventListener('resize', positionPicker);
   document.addEventListener('scroll', positionPicker, true);
 
+  // ---------- Saving to a file on your computer ----------
+  // The browser copy can be wiped by "Clear browsing data", so every change is also
+  // written to a .json file you pick once. The file's handle is remembered in IndexedDB.
+  const fileSupported = typeof window.showSaveFilePicker === 'function'
+    && typeof window.showOpenFilePicker === 'function'
+    && 'indexedDB' in window;
+  const PICKER_OPTIONS = {
+    id: 'habit-tracker',
+    types: [{ description: 'Habit tracker data', accept: { 'application/json': ['.json'] } }],
+  };
+  // status: 'unsupported' | 'checking' | 'none' | 'paused' (needs permission) | 'on' | 'error'
+  const file = { status: fileSupported ? 'checking' : 'unsupported', handle: null, lastSaved: null };
+
+  function idb(mode, run) {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open('habit-tracker', 1);
+      open.onupgradeneeded = () => open.result.createObjectStore('kv');
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const db = open.result;
+        let req;
+        try {
+          const tx = db.transaction('kv', mode, { durability: 'strict' });
+          req = run(tx.objectStore('kv'));
+          tx.oncomplete = () => { db.close(); resolve(req.result); };
+          tx.onerror = tx.onabort = () => { db.close(); reject(tx.error); };
+        } catch (err) {
+          db.close();
+          reject(err);
+        }
+      };
+    });
+  }
+  const rememberFile = handle => idb('readwrite', store => store.put(handle, 'file')).catch(() => {});
+  const recallFile = () => idb('readonly', store => store.get('file')).catch(() => null);
+
+  // Waits until the choice is stored, so closing the browser right away can't lose it.
+  async function linkFile(handle) {
+    file.handle = handle;
+    file.status = 'paused';
+    file.lastSaved = null;
+    await rememberFile(handle);
+  }
+
+  // Pull in anything the file has that this browser doesn't, then keep the file updated.
+  async function startAutoSave() {
+    try {
+      const text = await (await file.handle.getFile()).text();
+      if (text.trim()) mergeIn(parseBackup(text));
+    } catch {
+      // New, empty or unreadable file: it gets overwritten with your data below.
+    }
+    file.status = 'on';
+    renderSaveBar();
+    await writeNow();
+  }
+
+  let writeTimer = 0;
+  let writeQueue = Promise.resolve();
+
+  function queueFileWrite() {
+    if (file.status !== 'on') return;
+    clearTimeout(writeTimer);
+    writeTimer = setTimeout(writeNow, 400);
+  }
+
+  function writeNow() {
+    clearTimeout(writeTimer);
+    writeTimer = 0;
+    writeQueue = writeQueue.then(writeFile);
+    return writeQueue;
+  }
+
+  function flushFileWrite() {
+    if (writeTimer) writeNow();
+  }
+
+  async function writeFile() {
+    if (file.status !== 'on') return;
+    let writable = null;
+    try {
+      writable = await file.handle.createWritable();
+      await writable.write(backupText());
+      await writable.close();
+      file.lastSaved = new Date();
+    } catch (err) {
+      if (writable) writable.abort().catch(() => {});
+      file.status = err && err.name === 'NotAllowedError' ? 'paused' : 'error';
+    }
+    renderSaveBar();
+  }
+
+  async function saveToFile() {
+    let handle;
+    try {
+      handle = await window.showSaveFilePicker({ ...PICKER_OPTIONS, suggestedName: 'habits.json' });
+    } catch {
+      return; // picker closed
+    }
+    await linkFile(handle);
+    await startAutoSave();
+  }
+
+  async function loadFromFile() {
+    let handle;
+    try {
+      [handle] = await window.showOpenFilePicker(PICKER_OPTIONS);
+    } catch {
+      return; // picker closed
+    }
+    let picked;
+    try {
+      picked = await handle.getFile();
+    } catch {
+      flash(`Couldn't open ${handle.name}.`);
+      return;
+    }
+    if (!(await importFile(picked))) return;
+    let permission = 'prompt';
+    try {
+      permission = await handle.requestPermission({ mode: 'readwrite' });
+    } catch {
+      // The browser wants another click first; the Resume button handles that.
+    }
+    // Keep saving to the file that was just loaded.
+    await linkFile(handle);
+    if (permission === 'granted') await startAutoSave();
+    else renderSaveBar();
+  }
+
+  async function resumeAutoSave() {
+    let permission = 'denied';
+    try {
+      permission = await file.handle.requestPermission({ mode: 'readwrite' });
+    } catch {
+      // Treated as not allowed.
+    }
+    if (permission === 'granted') await startAutoSave();
+    else flash(`Permission wasn't given, so ${file.handle.name} isn't being updated.`);
+  }
+
+  async function importFile(picked) {
+    let incoming;
+    try {
+      incoming = parseBackup(await picked.text());
+    } catch {
+      flash(`${picked.name} isn't a habit tracker file.`);
+      return false;
+    }
+    mergeIn(incoming);
+    flash(`Loaded ${picked.name}.`);
+    return true;
+  }
+
+  function downloadBackup() {
+    const url = URL.createObjectURL(new Blob([backupText()], { type: 'application/json' }));
+    const link = el('a', { href: url, download: `habits-backup-${keyOf(startOfToday())}.json` });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  async function initFileSave() {
+    if (!fileSupported) return;
+    const handle = await recallFile();
+    if (!handle) {
+      file.status = 'none';
+      renderSaveBar();
+      return;
+    }
+    file.handle = handle;
+    file.status = 'paused';
+    let permission = 'prompt';
+    try {
+      permission = await handle.queryPermission({ mode: 'readwrite' });
+    } catch {
+      // Ask again with the Resume button.
+    }
+    if (permission === 'granted') await startAutoSave();
+    else renderSaveBar();
+  }
+
+  let notice = '';
+  let noticeTimer = 0;
+  function flash(message) {
+    notice = message;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => {
+      notice = '';
+      renderSaveBar();
+    }, 6000);
+    renderSaveBar();
+  }
+
+  function renderSaveBar() {
+    const name = file.handle ? file.handle.name : 'habits.json';
+    const views = {
+      unsupported: ['neutral', 'Saved in this browser',
+        'Download a backup now and then so nothing is lost if browser data gets cleared.',
+        [['download', 'Download backup', true], ['restore', 'Load backup…']]],
+      checking: ['neutral', 'Saved in this browser', ' ', []],
+      none: ['neutral', 'Saved in this browser',
+        'Also save to a file on your computer so nothing is lost if browser data gets cleared.',
+        [['save', 'Save to file…', true], ['load', 'Load file…']]],
+      on: ['ok', `Saved in this browser and in ${name}`,
+        file.lastSaved ? `Last saved to the file at ${fmtTime(file.lastSaved)}.` : 'Every change is also saved to the file.',
+        []],
+      paused: ['warn', `Saving to ${name} is paused`,
+        'The browser needs your OK again after a restart. Your data is still saved in this browser.',
+        [['resume', 'Resume saving', true]]],
+      error: ['bad', `Couldn't save to ${name}`,
+        'It may have been moved or deleted. Your data is still saved in this browser.',
+        [['save', 'Save to file…', true], ['load', 'Load file…']]],
+    };
+    let [tone, title, sub, actions] = views[file.status];
+    if (!localOk) {
+      tone = 'bad';
+      title = 'Your browser is blocking its storage';
+      if (file.status === 'on') sub = `Your data is only being saved to ${name}.`;
+      else if (file.status === 'unsupported') sub = 'Download a backup before closing this page or your changes will be lost.';
+      else sub = 'Save to a file or your changes will be lost when you close this page.';
+    }
+
+    const bar = $('save-bar');
+    bar.dataset.tone = tone;
+    $('save-title').textContent = title;
+    $('save-sub').textContent = notice || sub;
+    const signature = actions.map(a => a[0]).join();
+    if (bar.dataset.actions !== signature) {
+      bar.dataset.actions = signature;
+      $('save-actions').replaceChildren(...actions.map(([action, label, primary]) =>
+        el('button', { type: 'button', className: primary ? 'small-btn primary' : 'small-btn', dataset: { action } }, label)));
+    }
+  }
+
+  $('save-actions').addEventListener('click', e => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'save') saveToFile();
+    else if (action === 'load') loadFromFile();
+    else if (action === 'resume') resumeAutoSave();
+    else if (action === 'download') downloadBackup();
+    else if (action === 'restore') $('backup-input').click();
+  });
+
+  $('backup-input').addEventListener('change', e => {
+    const [picked] = e.target.files;
+    e.target.value = '';
+    if (picked) importFile(picked);
+  });
+
   // ---------- Week navigation ----------
   $('prev').addEventListener('click', () => {
     weekStart = addDays(weekStart, -7);
@@ -430,22 +728,31 @@
   }
   setInterval(checkDate, 60 * 1000);
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) checkDate();
+    if (document.hidden) flushFileWrite();
+    else checkDate();
   });
+  window.addEventListener('pagehide', flushFileWrite);
 
   // Keep multiple open tabs in sync.
   window.addEventListener('storage', e => {
     if (e.key !== null && e.key !== STORAGE_KEY) return;
-    data = load();
+    loadLocal();
     render();
+    queueFileWrite();
   });
 
+  // ---------- Start ----------
+  loadLocal();
   try {
     localStorage.setItem(`${STORAGE_KEY}:test`, '1');
     localStorage.removeItem(`${STORAGE_KEY}:test`);
   } catch {
-    warnNoStorage();
+    localOk = false;
   }
+  // Ask the browser not to clear this site's storage when the disk gets full.
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
   render();
+  renderSaveBar();
+  initFileSave();
 })();
